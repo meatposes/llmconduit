@@ -1,0 +1,27 @@
+services:
+  llmconduit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: llmconduit:latest
+    container_name: llmconduit
+    networks:
+      - ai-network
+    ports:
+      - "${PROXY_PORT:-8000}:${PROXY_PORT:-8000}"
+    volumes:
+      - ./config.yaml:/etc/llmconduit/config.yaml:ro
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:${PROXY_PORT:-8000}/health').read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+networks:
+  ai-network:
+    external: true
