@@ -1,0 +1,43 @@
+# llmconduit — backend config
+# ---------------------------------------------------------------------------
+# Add one entry per backend. Only 'url' is required.
+#
+# Backend name is derived automatically from the hostname:
+#   http://my-llama-server:8080   →  my-llama-server
+#   http://ollama-host:11434      →  ollama-host
+#   http://192.168.1.50:8000      →  192.168.1.50
+#
+# Models are always exposed as: <model-id>@<backend-name>
+#   e.g.  llama3.1-8b@my-llama-server
+#         mistral-7b@ollama-host
+#
+# api_key (optional): name of the env var in .env holding the real key.
+# If omitted, the caller's Authorization header is forwarded unchanged.
+# ---------------------------------------------------------------------------
+
+backends:
+  - url: http://backend-a:8000
+    # no api_key — open backend, caller auth forwarded as-is
+
+  - url: http://backend-b:8000
+    # no api_key — open backend, caller auth forwarded as-is
+
+  # Keyed backend example:
+  # - url: http://some-external-api:443
+  #   api_key: EXTERNAL_API_KEY    # must be set in .env
+
+# ---------------------------------------------------------------------------
+# Aliases — stable, high-level role names that resolve to a real
+# "<model-id>@<backend-name>" target. Point a tool at the alias once
+# (e.g. model: "PRIMARY") and it keeps working no matter which model or
+# backend actually serves that role — retarget it here (edit + /admin/reload)
+# or instantly via /admin/ui (or POST /admin/alias/<name>) without touching
+# any downstream tool config.
+#
+# Names are matched case-insensitively. A role only shows up in /v1/models
+# while its target currently resolves to a healthy backend.
+# ---------------------------------------------------------------------------
+
+aliases:
+  PRIMARY: my-model@backend-a
+  AUXILIARY: another-model@backend-b
