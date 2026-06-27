@@ -30,7 +30,7 @@ BACKEND_SCAN_TIMEOUT     = float(os.environ.get("BACKEND_SCAN_TIMEOUT", "10"))
 REQUEST_TIMEOUT          = float(os.environ.get("REQUEST_TIMEOUT", "600"))
 REQUEST_CONNECT_TIMEOUT  = float(os.environ.get("REQUEST_CONNECT_TIMEOUT", "10"))
 LOG_LEVEL                = os.environ.get("LOG_LEVEL", "info").upper()
-CONFIG_PATH              = "/etc/llmconduit/config.yaml"
+CONFIG_PATH              = os.environ.get("CONFIG_PATH", "/etc/llmconduit/config.yaml")
 
 ADMIN_ENABLED = bool(ADMIN_TOKEN)
 

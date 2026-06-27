@@ -16,11 +16,10 @@
 # ---------------------------------------------------------------------------
 
 backends:
-  - url: http://backend-a:8000
-    # no api_key — open backend, caller auth forwarded as-is
+  # - url: http://my-llama-server:8080
+  #   # no api_key — open backend, caller auth forwarded as-is
 
-  - url: http://backend-b:8000
-    # no api_key — open backend, caller auth forwarded as-is
+  # - url: http://ollama-host:11434
 
   # Keyed backend example:
   # - url: http://some-external-api:443
@@ -39,5 +38,5 @@ backends:
 # ---------------------------------------------------------------------------
 
 aliases:
-  PRIMARY: my-model@backend-a
-  AUXILIARY: another-model@backend-b
+  # PRIMARY: my-model@my-llama-server
+  # AUXILIARY: another-model@ollama-host

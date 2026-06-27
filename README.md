@@ -53,15 +53,18 @@ flowchart TD
 ## Quickstart
 
 ```bash
-# 1. copy and fill in secrets
+# 1. REQUIRED — copy the template and set your secrets before anything else
 cp .env.template .env
-# set PROXY_API_KEY (required) and optionally ADMIN_TOKEN
+#   open .env and set PROXY_API_KEY to any strong secret string
+#   optionally set ADMIN_TOKEN to enable the /admin/* endpoints
 
-# 2. edit config.yaml — add your backends and aliases
+# 2. edit config.yaml — uncomment and fill in your backends and aliases
 
 # 3. bring it up
 docker compose up -d
 ```
+
+> **Note:** The container will refuse to start if `PROXY_API_KEY` is not set in `.env`.
 
 The proxy listens on port `8000` by default (`PROXY_PORT` to override).
 
@@ -89,10 +92,13 @@ aliases:
 
 ### Environment variables
 
+All variables are set in `.env` (copy from `.env.template`).
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `PROXY_API_KEY` | Yes | — | Shared key all clients use to authenticate |
+| `PROXY_API_KEY` | **Yes** | — | Shared key all clients use to authenticate |
 | `ADMIN_TOKEN` | No | — | Enables `/admin/*` endpoints; omit to disable |
+| `CONFIG_PATH` | No | `/etc/llmconduit/config.yaml` | Path to config file (override for local runs) |
 | `REFRESH_INTERVAL_SECONDS` | No | `60` | How often to poll backends for model lists |
 | `MISS_RETRY_ATTEMPTS` | No | `3` | Rescans before returning 404 on a routing miss |
 | `MISS_RETRY_DELAY_SECONDS` | No | `2` | Delay between miss retry rescans |
@@ -143,13 +149,34 @@ Unauthenticated. Returns backend counts and model count.
 
 ## Docker
 
-The `docker-compose.yml` references an external Docker network named `ai-network`. Create it if it doesn't exist:
+`config.yaml` is bind-mounted read-only into the container at `/etc/llmconduit/config.yaml`.
 
-```bash
-docker network create ai-network
+By default, `docker-compose.yml` uses Docker's default bridge network. llmconduit reaches backends by IP or by hostname if they're on the same compose network.
+
+### Connecting to backends on an external Docker network
+
+If your LLM backends live in a separate compose stack on a named network, attach llmconduit to it with an override file:
+
+```yaml
+# docker-compose.override.yml
+services:
+  llmconduit:
+    networks:
+      - ai-network
+
+networks:
+  ai-network:
+    external: true
 ```
 
-`config.yaml` is bind-mounted read-only into `/etc/llmconduit/config.yaml` inside the container.
+Docker Compose merges this with `docker-compose.yml` automatically on `docker compose up`. You can name the network whatever matches your existing stack.
+
+### Running without Docker
+
+```bash
+pip install -r app/requirements.txt
+CONFIG_PATH=./config.yaml PROXY_API_KEY=your-key uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
 
 ## License
 
