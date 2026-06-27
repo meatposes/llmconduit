@@ -15,6 +15,9 @@ venv/
 # Tool-generated analysis
 graphify-out/
 
+# Claude Code local state
+.claude/
+
 # Editor / OS
 .DS_Store
 *.swp
