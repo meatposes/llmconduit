@@ -1,6 +1,9 @@
 # Environment — never commit real secrets
 .env
 
+# Local backend config — real hosts stay out of the repo
+config.local.yaml
+
 # Python
 __pycache__/
 *.pyc

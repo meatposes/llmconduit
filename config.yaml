@@ -7,12 +7,24 @@
 #   http://ollama-host:11434      →  ollama-host
 #   http://192.168.1.50:8000      →  192.168.1.50
 #
-# Models are always exposed as: <model-id>@<backend-name>
+# You can optionally set a human-friendly 'alias' that replaces the hostname
+# in all model identifiers:
+#   alias: openarc-node
+#   →  models appear as: mistral-7b@openarc-node  (not @192.168.1.50)
+#
+# Models are always exposed as: <model-id>@<backend-name-or-alias>
 #   e.g.  llama3.1-8b@my-llama-server
-#         mistral-7b@ollama-host
+#         mistral-7b@openarc-node
+#
+# An alias must be unique across backends and must not contain '@' — an invalid
+# alias is ignored (with a log entry) and the hostname is used instead.
 #
 # api_key (optional): name of the env var in .env holding the real key.
 # If omitted, the caller's Authorization header is forwarded unchanged.
+#
+# This file is tracked in git. To keep your real backends out of the repo, copy
+# it to config.local.yaml (gitignored) and set CONFIG_FILE=config.local.yaml
+# in .env.
 # ---------------------------------------------------------------------------
 
 backends:
@@ -24,6 +36,13 @@ backends:
   # Keyed backend example:
   # - url: http://some-external-api:443
   #   api_key: EXTERNAL_API_KEY    # must be set in .env
+
+  # Alias example — required when two backends share a hostname, otherwise both
+  # get the same name and their model ids collide:
+  # - url: http://192.168.1.50:8000
+  #   alias: openarc-node          # models show as model-id@openarc-node
+  # - url: http://192.168.1.50:8001
+  #   alias: openarc-node-2
 
 # ---------------------------------------------------------------------------
 # Aliases — stable, high-level role names that resolve to a real

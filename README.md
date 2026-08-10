@@ -80,15 +80,40 @@ backends:
   - url: http://another-server:11434
     api_key: ANOTHER_SERVER_KEY   # env var name; value set in .env
 
+  - url: http://192.168.1.50:8000
+    alias: openarc-node           # models show as model-id@openarc-node
+
 aliases:
   PRIMARY: llama3.1-8b@my-llama-server
   CODING:  deepseek-coder@another-server
 ```
 
-- **Backend name** is derived from the hostname automatically
+- **Backend name** is derived from the hostname automatically, or set explicitly with `alias`
 - **Models** are exposed as `model-id@backend-name`
 - **Aliases** are case-insensitive; a role only appears in `/v1/models` while its target backend is healthy
 - Change `config.yaml` and call `POST /admin/reload` (or `docker compose restart`) to apply
+
+#### Backend `alias`
+
+`alias` replaces the hostname-derived name in every model id, so `mistral-7b@192.168.1.50`
+becomes `mistral-7b@openarc-node`.
+
+It is **required** when two backends share a hostname — several vLLM instances on
+different ports of one machine, for example. Without it both are named after the same
+host, their model ids collide, and only one of them stays reachable. An alias must be
+unique across backends and must not contain `@`; an invalid alias is ignored (logged
+as an error) and the hostname is used instead.
+
+#### Keeping your real backends out of git
+
+`config.yaml` is tracked, so edits to it conflict on every `git pull` and any internal
+hostnames end up in the repo. Copy it instead:
+
+```bash
+cp config.yaml config.local.yaml     # gitignored
+echo "CONFIG_FILE=config.local.yaml" >> .env
+docker compose up -d
+```
 
 ### Environment variables
 

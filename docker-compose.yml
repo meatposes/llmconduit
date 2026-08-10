@@ -8,7 +8,8 @@ services:
     ports:
       - "${PROXY_PORT:-8000}:${PROXY_PORT:-8000}"
     volumes:
-      - ./config.yaml:/etc/llmconduit/config.yaml:ro
+      # CONFIG_FILE lets you keep real backends in a gitignored config.local.yaml
+      - ./${CONFIG_FILE:-config.yaml}:/etc/llmconduit/config.yaml:ro
     env_file:
       - .env
     restart: unless-stopped

@@ -65,15 +65,32 @@ def resolve_backend_key(key_ref: Optional[str]) -> Optional[str]:
 def backend_name_from_url(url: str) -> str:
     url = re.sub(r"^https?://", "", url)
     url = url.split("/")[0]
-    url = url.split(":")[0]
-    return url
+    return url.split(":")[0]
+
+def normalize_alias(url: str, alias: Optional[str]) -> Optional[str]:
+    """Validate a configured backend alias. Returns the cleaned alias, or None
+    if it is unset or unusable — in which case the hostname is used instead."""
+    if alias is None:
+        return None
+    alias = str(alias).strip()
+    if not alias:
+        return None
+    if "@" in alias:
+        log.error(
+            "Backend '%s': alias '%s' contains '@' — ignoring it and using the hostname. "
+            "Models are exposed as '<model-id>@<backend-name>', so an '@' in the alias "
+            "breaks model resolution.",
+            url, alias,
+        )
+        return None
+    return alias
 
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 class BackendRegistry:
     def __init__(self):
-        # { backend_url: { name, models, healthy, api_key_ref } }
+        # { backend_url: { name, models, healthy, api_key_ref, alias } }
         self._backends: dict[str, dict] = {}
         # { qualified_model_id: backend_url }
         self._routing: dict[str, str] = {}
@@ -109,19 +126,29 @@ class BackendRegistry:
         data = resp.json()
         return [m["id"] for m in data.get("data", [])]
 
-    async def _scan_one(self, client: httpx.AsyncClient, url: str, api_key_ref: Optional[str]) -> dict:
-        bname = backend_name_from_url(url)
+    async def _scan_one(self, client: httpx.AsyncClient, url: str, api_key_ref: Optional[str], alias: Optional[str] = None) -> dict:
+        alias = normalize_alias(url, alias)
+        bname = alias or backend_name_from_url(url)
         api_key = resolve_backend_key(api_key_ref)
         try:
             models = await self._fetch_models(client, url, api_key)
             log.info("Backend '%s' healthy — models: %s", bname, models)
-            return {"name": bname, "models": models, "healthy": True, "api_key_ref": api_key_ref}
+            return {"name": bname, "models": models, "healthy": True, "api_key_ref": api_key_ref, "alias": alias}
         except Exception as exc:
             log.warning("Backend '%s' unreachable: %s", bname, exc)
-            return {"name": bname, "models": [], "healthy": False, "api_key_ref": api_key_ref}
+            return {"name": bname, "models": [], "healthy": False, "api_key_ref": api_key_ref, "alias": alias}
 
     async def _rebuild_routing(self, new_backends: dict[str, dict], new_aliases: dict[str, str]):
         new_routing: dict[str, str] = {}
+        seen_names: dict[str, str] = {}
+        for url, info in new_backends.items():
+            first_url = seen_names.setdefault(info["name"], url)
+            if first_url != url:
+                log.error(
+                    "Backends '%s' and '%s' both resolve to the name '%s' — their model ids "
+                    "collide and targeted rescans only reach the first. Give each a unique 'alias'.",
+                    first_url, url, info["name"],
+                )
         for url, info in new_backends.items():
             if info["healthy"]:
                 for mid in info["models"]:
@@ -157,7 +184,7 @@ class BackendRegistry:
         aliases = {str(k).upper(): v for k, v in (cfg.get("aliases") or {}).items()}
         async with httpx.AsyncClient() as client:
             results = await asyncio.gather(
-                *[self._scan_one(client, e["url"].rstrip("/"), e.get("api_key")) for e in entries],
+                *[self._scan_one(client, e["url"].rstrip("/"), e.get("api_key"), e.get("alias")) for e in entries],
                 return_exceptions=False,
             )
         new_backends = {
@@ -178,7 +205,7 @@ class BackendRegistry:
                 log.warning("Targeted rescan: backend '%s' not in config", backend_url)
                 return
             async with httpx.AsyncClient() as client:
-                info = await self._scan_one(client, backend_url, entry.get("api_key"))
+                info = await self._scan_one(client, backend_url, entry.get("api_key"), entry.get("alias"))
             async with self._rw_lock:
                 self._backends[backend_url] = info
                 # Remove old routes for this backend, add new ones
@@ -272,6 +299,7 @@ class BackendRegistry:
             "backends": {
                 url: {
                     "name": info["name"],
+                    "alias": info.get("alias"),
                     "healthy": info["healthy"],
                     "models": [f"{m}@{info['name']}" for m in info["models"]],
                     "has_api_key": bool(info.get("api_key_ref")),
