@@ -150,6 +150,8 @@ All inference endpoints require `Authorization: Bearer <PROXY_API_KEY>`.
 | `POST` | `/v1/chat/completions` | Chat completions (streaming supported) |
 | `POST` | `/v1/completions` | Text completions |
 | `POST` | `/v1/embeddings` | Embeddings |
+| `POST` | `/v1/audio/*` | Speech, transcriptions, translations and backend extras; JSON or multipart, response streamed through as-is |
+| `POST` | `/v1/rerank` | Rerank |
 | `*` | `/{path}` | Catch-all: routes to first healthy backend |
 
 ### Health

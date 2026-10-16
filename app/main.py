@@ -452,15 +452,22 @@ async def _proxy(
 async def _routed_proxy(request: Request) -> Response:
     """Resolve model → backend, with miss-triggered retry loop."""
     body = await request.body()
+    backend_url, raw_model_id = await _resolve_model(_json_model(body))
+    rewritten = _rewrite_model(body, raw_model_id)
+    return await _proxy(request, backend_url, rewritten_body=rewritten)
+
+def _json_model(body: bytes) -> str:
     try:
         data = json.loads(body)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
-
-    qualified = data.get("model", "")
+    qualified = data.get("model", "") if isinstance(data, dict) else ""
     if not qualified:
         raise HTTPException(status_code=400, detail="Missing 'model' field")
+    return qualified
 
+async def _resolve_model(qualified: str) -> tuple[str, str]:
+    """Model or role alias → (backend url, raw model id), rescanning the backend on a miss."""
     # Role alias (e.g. PRIMARY) → its current qualified target
     alias_target = registry.resolve_alias(qualified)
     if alias_target:
@@ -509,10 +516,101 @@ async def _routed_proxy(request: Request) -> Response:
             },
         )
 
-    raw_model_id = qualified.rsplit("@", 1)[0]
-    rewritten = _rewrite_model(body, raw_model_id)
     log.info("Routing '%s' → %s", qualified, backend_url)
-    return await _proxy(request, backend_url, rewritten_body=rewritten)
+    return backend_url, qualified.rsplit("@", 1)[0]
+
+# ---------------------------------------------------------------------------
+# Audio and other non-chat endpoints
+# ---------------------------------------------------------------------------
+# These used to fall through to the catch-all, which sends everything to the
+# first healthy backend whatever the model: a TTS request for an OpenArc model
+# went to a vLLM backend and came back 404. They take JSON (speech, rerank) or
+# multipart (transcriptions: the audio file plus a 'model' field), and answer
+# with audio, text or JSON, sometimes streamed with the stream flag nested in a
+# backend-specific block (OpenArc's openarc_tts.kokoro.stream). So: route by
+# model like chat, and pass the response through as it comes, with the
+# backend's own status and content type, without buffering it first.
+
+def _multipart_boundary(content_type: str) -> Optional[bytes]:
+    m = re.search(r'boundary="?([^";]+)"?', content_type or "")
+    return m.group(1).encode() if m else None
+
+def _multipart_model(body: bytes, boundary: bytes) -> tuple[Optional[str], Optional[tuple[int, int]]]:
+    """The 'model' field of a multipart body and the byte span of its value (for rewriting it)."""
+    delim = b"--" + boundary
+    pos = body.find(delim)
+    while pos >= 0:
+        head_start = pos + len(delim)
+        if body[head_start:head_start + 2] == b"--":          # closing delimiter
+            break
+        head_end = body.find(b"\r\n\r\n", head_start)
+        if head_end < 0:
+            break
+        value_start = head_end + 4
+        nxt = body.find(b"\r\n" + delim, value_start)
+        if nxt < 0:
+            break
+        headers = body[head_start:head_end].decode("latin-1")
+        if re.search(r'^content-disposition:[^\r\n]*;\s*name="model"', headers, re.I | re.M):
+            return body[value_start:nxt].decode("utf-8", "replace").strip(), (value_start, nxt)
+        pos = nxt + 2
+    return None, None
+
+async def _routed_passthrough(request: Request) -> Response:
+    """Route a JSON or multipart request by its model; stream the answer back untouched."""
+    body = await request.body()
+    content_type = request.headers.get("content-type", "")
+    if content_type.lower().startswith("multipart/form-data"):
+        boundary = _multipart_boundary(content_type)
+        qualified, span = _multipart_model(body, boundary) if boundary else (None, None)
+        if not qualified:
+            raise HTTPException(status_code=400, detail="Missing 'model' field")
+        backend_url, raw_model_id = await _resolve_model(qualified)
+        body = body[:span[0]] + raw_model_id.encode() + body[span[1]:]
+    else:
+        backend_url, raw_model_id = await _resolve_model(_json_model(body))
+        body = _rewrite_model(body, raw_model_id)
+    return await _passthrough(request, backend_url, body)
+
+async def _passthrough(request: Request, backend_url: str, body: bytes) -> Response:
+    target = f"{backend_url}{request.url.path}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+    headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in ("host", "content-length", "authorization")
+    }
+    headers = _inject_auth(headers, backend_url, request.headers.get("Authorization"))
+
+    # The upstream response is opened before the StreamingResponse is built, so
+    # its status (and content type) are known in time; client and response
+    # outlive this handler and are closed when the body is done.
+    client = httpx.AsyncClient(timeout=_make_timeout())
+    try:
+        resp = await client.send(
+            client.build_request(request.method, target, headers=headers, content=body), stream=True,
+        )
+    except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.TimeoutException) as exc:
+        await client.aclose()
+        log.error("Connection error to %s: %s", backend_url, exc)
+        raise HTTPException(status_code=502, detail=f"Backend unreachable: {backend_url}")
+    if resp.status_code >= 400:
+        log.warning("Backend %s returned %d for %s", backend_url, resp.status_code, request.url.path)
+
+    async def _relay():
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    passed = {
+        k: v for k, v in resp.headers.items()
+        if k.lower() not in ("content-encoding", "transfer-encoding", "content-length", "connection")
+    }
+    passed["X-Accel-Buffering"] = "no"
+    return StreamingResponse(_relay(), status_code=resp.status_code, headers=passed)
 
 # ---------------------------------------------------------------------------
 # Inference routes
@@ -532,6 +630,15 @@ async def completions(request: Request):
 @app.post("/v1/embeddings", dependencies=[Depends(require_proxy_auth)])
 async def embeddings(request: Request):
     return await _routed_proxy(request)
+
+@app.post("/v1/audio/{endpoint:path}", dependencies=[Depends(require_proxy_auth)])
+async def audio(request: Request, endpoint: str):
+    """speech, transcriptions, translations, and backend extras (OpenArc's diarization, voiceprint)."""
+    return await _routed_passthrough(request)
+
+@app.post("/v1/rerank", dependencies=[Depends(require_proxy_auth)])
+async def rerank(request: Request):
+    return await _routed_passthrough(request)
 
 @app.get("/health")
 async def health():
