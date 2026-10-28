@@ -48,6 +48,7 @@ flowchart TD
 - **Admin UI** — browser-based alias switcher at `/admin/ui?token=<ADMIN_TOKEN>`
 - **Admin API** — programmatic alias overrides, rescan, reload via `/admin/*` endpoints
 - **Streaming** — full SSE / chunked-transfer passthrough
+- **Prometheus metrics** — one `/metrics` for everything: requests, latency, time to first token and tokens per model and backend, plus every backend's own metrics tagged with its name
 - **Docker-native** — single container, config mounted as a volume
 
 ## Quickstart
@@ -132,6 +133,11 @@ All variables are set in `.env` (copy from `.env.template`).
 | `REQUEST_CONNECT_TIMEOUT` | No | `10` | Connection establishment timeout |
 | `LOG_LEVEL` | No | `info` | `debug`, `info`, `warning`, `error` |
 | `PROXY_PORT` | No | `8000` | Port the proxy listens on |
+| `METRICS_TOKEN` | No | — | If set, `/metrics` requires `Authorization: Bearer <METRICS_TOKEN>`; otherwise it is open |
+| `BACKEND_METRICS` | No | `true` | Include each backend's own `/metrics` in llmconduit's `/metrics` |
+| `BACKEND_METRICS_TIMEOUT` | No | `5` | Seconds to wait for one backend's `/metrics` before leaving it out of that scrape |
+| `FALLBACK_TO_FIRST_HEALTHY` | No | `false` | Send requests that name no model (on endpoints not listed under API) to the first healthy backend instead of returning 404 — the pre-routing behaviour |
+| `STREAM_USAGE` | No | `true` | Ask backends for token usage on streamed chat/completions so it can be counted (see Metrics) |
 
 Per-backend API keys are also set in `.env` and referenced by name in `config.yaml`:
 ```
@@ -150,7 +156,10 @@ All inference endpoints require `Authorization: Bearer <PROXY_API_KEY>`.
 | `POST` | `/v1/chat/completions` | Chat completions (streaming supported) |
 | `POST` | `/v1/completions` | Text completions |
 | `POST` | `/v1/embeddings` | Embeddings |
-| `*` | `/{path}` | Catch-all: routes to first healthy backend |
+| `POST` | `/v1/audio/*` | Speech, transcriptions, translations and backend extras; JSON or multipart, response streamed through as-is |
+| `POST` | `/v1/rerank` | Rerank |
+| `GET` | `/v1/models/{model}` | One model or alias |
+| `*` | `/{path}` | Any other endpoint (`/v1/responses`, `/v1/messages`, `/tokenize`, `/v2/rerank`, …): routed by the `model` in its JSON or multipart body and passed through as-is. A request with no model gets a 404 unless `FALLBACK_TO_FIRST_HEALTHY=true` |
 
 ### Health
 
@@ -158,6 +167,55 @@ All inference endpoints require `Authorization: Bearer <PROXY_API_KEY>`.
 GET /health
 ```
 Unauthenticated. Returns backend counts and model count.
+
+### Metrics
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/metrics` | Everything, text or OpenMetrics by `Accept`: llmconduit's own metrics plus every healthy backend's `/metrics` |
+
+Open unless `METRICS_TOKEN` is set. The inference key never works here, and the metrics token never works for inference.
+
+On each scrape llmconduit reads every healthy backend's `/metrics` in parallel (with the backend's own key, if it has one) and adds a `backend` label to every sample, so vLLM's KV cache, prefix-cache and queue numbers arrive next to the gateway's. A backend with no `/metrics` (404) is left out; one that fails or takes longer than `BACKEND_METRICS_TIMEOUT` is skipped for that scrape and shows `llmconduit_backend_metrics_up 0`. A label already called `backend` becomes `exported_backend`. `*_created` series are dropped.
+
+What llmconduit measures, labelled by `model` and `backend` (names follow the OpenTelemetry GenAI metrics):
+
+| Metric | Type | Labels |
+|---|---|---|
+| `llmconduit_requests_total` | counter | `endpoint`, `model`, `backend`, `alias`, `status` |
+| `llmconduit_request_duration_seconds` | histogram | `endpoint`, `model`, `backend` |
+| `llmconduit_time_to_first_token_seconds` | histogram | streamed chat/completions |
+| `llmconduit_time_per_output_token_seconds` | histogram | streamed chat/completions with usage |
+| `llmconduit_tokens_total` | counter | `type` = `input` or `output`, from response usage |
+| `llmconduit_requests_in_flight` | gauge | |
+| `llmconduit_backend_errors_total` | counter | `backend`, `kind` |
+| `llmconduit_backend_up` | gauge | `backend`, from the last model scan |
+| `llmconduit_alias_info` | gauge | `alias`, `model`, `backend`, `source` — where each alias points |
+| `llmconduit_backend_metrics_up` | gauge | `backend` — 1 if its `/metrics` was read on this scrape |
+| `llmconduit_backend_metrics_scrape_seconds` | gauge | `backend` |
+
+- `status` is the backend's HTTP status, `502` when the backend could not be reached or dropped mid-request, or `499` when the client hung up mid-stream. Requests rejected before routing (unknown model, bad body) are counted with empty `model` and `backend`.
+- Token counts on streams need the backend's final usage chunk. With `STREAM_USAGE=true`, llmconduit adds `stream_options.include_usage` when the caller did not, and drops that extra chunk before it reaches the caller. Chunks may carry `"usage": null`, as the OpenAI spec allows.
+
+To follow an alias whichever backend it points at, join on `llmconduit_alias_info`:
+
+```promql
+# gateway numbers
+sum by (model) (rate(llmconduit_tokens_total{type="output"}[5m])
+  * on (model, backend) group_left (alias) llmconduit_alias_info{alias="PRIMARY"})
+# a backend's own numbers
+vllm:kv_cache_usage_perc * on (backend) group_left (alias) llmconduit_alias_info{alias="PRIMARY"}
+```
+
+Prometheus config:
+
+```yaml
+scrape_configs:
+  - job_name: llmconduit
+    static_configs:
+      - targets: ['llmconduit-host:8000']
+    # authorization: {credentials_file: /etc/prometheus/llmconduit-metrics-token}   # if METRICS_TOKEN is set
+```
 
 ### Admin (requires `ADMIN_TOKEN`)
 
