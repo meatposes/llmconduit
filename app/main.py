@@ -65,6 +65,7 @@ METRICS_TOKEN            = os.environ.get("METRICS_TOKEN", "")
 STREAM_USAGE             = os.environ.get("STREAM_USAGE", "true").lower() in ("1", "true", "yes")
 BACKEND_METRICS          = os.environ.get("BACKEND_METRICS", "true").lower() in ("1", "true", "yes")
 BACKEND_METRICS_TIMEOUT  = float(os.environ.get("BACKEND_METRICS_TIMEOUT", "5"))
+FALLBACK_TO_FIRST_HEALTHY = os.environ.get("FALLBACK_TO_FIRST_HEALTHY", "false").lower() in ("1", "true", "yes")
 
 ADMIN_ENABLED = bool(ADMIN_TOKEN)
 
@@ -770,9 +771,9 @@ async def _proxy(
             media_type=resp.headers.get("content-type"),
         )
 
-def _count_rejected(request: Request, status_code: int) -> None:
+def _count_rejected(request: Request, status_code: int, endpoint: Optional[str] = None) -> None:
     """A request turned away before reaching a backend; model is left blank since the caller made it up."""
-    REQUESTS.labels(request.url.path, "", "", "", str(status_code)).inc()
+    REQUESTS.labels(endpoint or request.url.path, "", "", "", str(status_code)).inc()
 
 async def _routed_proxy(request: Request) -> Response:
     """Resolve model → backend, with miss-triggered retry loop."""
@@ -887,6 +888,19 @@ def _multipart_model(body: bytes, boundary: bytes) -> tuple[Optional[str], Optio
         pos = nxt + 2
     return None, None
 
+def _body_model(request: Request, body: bytes) -> Optional[str]:
+    """The model a JSON or multipart body names, or None."""
+    content_type = request.headers.get("content-type", "")
+    if content_type.lower().startswith("multipart/form-data"):
+        boundary = _multipart_boundary(content_type)
+        return _multipart_model(body, boundary)[0] if boundary else None
+    try:
+        data = json.loads(body)
+    except Exception:
+        return None
+    model = data.get("model") if isinstance(data, dict) else None
+    return model if isinstance(model, str) and model else None
+
 async def _routed_passthrough(request: Request) -> Response:
     """Route a JSON or multipart request by its model; stream the answer back untouched."""
     body = await request.body()
@@ -975,6 +989,15 @@ async def _passthrough(request: Request, backend_url: str, body: bytes, model: s
 @app.get("/v1/models", dependencies=[Depends(require_proxy_auth)])
 async def list_models():
     return {"object": "list", "data": registry.all_models()}
+
+@app.get("/v1/models/{model_id:path}", dependencies=[Depends(require_proxy_auth)])
+async def get_model(model_id: str):
+    for entry in registry.all_models():
+        if entry["id"] == model_id or entry["id"] == model_id.upper():
+            return entry
+    raise HTTPException(status_code=404, detail={"error": {
+        "message": f"The model '{model_id}' does not exist", "type": "invalid_request_error",
+        "param": "model", "code": "model_not_found"}})
 
 @app.post("/v1/chat/completions", dependencies=[Depends(require_proxy_auth)])
 async def chat_completions(request: Request):
@@ -1236,8 +1259,22 @@ async def admin_ui():
     dependencies=[Depends(require_proxy_auth)],
 )
 async def catch_all(request: Request, path: str):
-    """Best-effort fallback: route to first healthy backend."""
-    healthy = [u for u, info in registry._backends.items() if info["healthy"]]
-    if not healthy:
-        raise HTTPException(status_code=503, detail="No healthy backends available")
-    return await _proxy(request, healthy[0])
+    """Any other endpoint: routed by the model it names, like the ones above.
+
+    Without a model there is no right backend to pick, so it is a 404 unless
+    FALLBACK_TO_FIRST_HEALTHY restores the old send-to-the-first-healthy-backend.
+    """
+    body = await request.body()
+    if _body_model(request, body):
+        return await _routed_passthrough(request)
+    if FALLBACK_TO_FIRST_HEALTHY:
+        healthy = [u for u, info in registry._backends.items() if info["healthy"]]
+        if not healthy:
+            raise HTTPException(status_code=503, detail="No healthy backends available")
+        log.warning("%s /%s names no model — sending it to the first healthy backend %s",
+                    request.method, path, healthy[0])
+        return await _proxy(request, healthy[0])
+    _count_rejected(request, 404, endpoint="other")
+    raise HTTPException(status_code=404, detail=(
+        f"No route for {request.method} /{path}: llmconduit routes by the request's 'model' "
+        "and this request names none"))

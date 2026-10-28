@@ -136,6 +136,7 @@ All variables are set in `.env` (copy from `.env.template`).
 | `METRICS_TOKEN` | No | — | If set, `/metrics` requires `Authorization: Bearer <METRICS_TOKEN>`; otherwise it is open |
 | `BACKEND_METRICS` | No | `true` | Include each backend's own `/metrics` in llmconduit's `/metrics` |
 | `BACKEND_METRICS_TIMEOUT` | No | `5` | Seconds to wait for one backend's `/metrics` before leaving it out of that scrape |
+| `FALLBACK_TO_FIRST_HEALTHY` | No | `false` | Send requests that name no model (on endpoints not listed under API) to the first healthy backend instead of returning 404 — the pre-routing behaviour |
 | `STREAM_USAGE` | No | `true` | Ask backends for token usage on streamed chat/completions so it can be counted (see Metrics) |
 
 Per-backend API keys are also set in `.env` and referenced by name in `config.yaml`:
@@ -157,7 +158,8 @@ All inference endpoints require `Authorization: Bearer <PROXY_API_KEY>`.
 | `POST` | `/v1/embeddings` | Embeddings |
 | `POST` | `/v1/audio/*` | Speech, transcriptions, translations and backend extras; JSON or multipart, response streamed through as-is |
 | `POST` | `/v1/rerank` | Rerank |
-| `*` | `/{path}` | Catch-all: routes to first healthy backend |
+| `GET` | `/v1/models/{model}` | One model or alias |
+| `*` | `/{path}` | Any other endpoint (`/v1/responses`, `/v1/messages`, `/tokenize`, `/v2/rerank`, …): routed by the `model` in its JSON or multipart body and passed through as-is. A request with no model gets a 404 unless `FALLBACK_TO_FIRST_HEALTHY=true` |
 
 ### Health
 
