@@ -17,6 +17,10 @@ import yaml
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+from prometheus_client.core import GaugeMetricFamily, Metric
+from prometheus_client.exposition import choose_encoder
+from prometheus_client.parser import text_string_to_metric_families
 
 # ---------------------------------------------------------------------------
 # Config from environment
@@ -57,6 +61,10 @@ REQUEST_TIMEOUT          = float(os.environ.get("REQUEST_TIMEOUT", "600"))
 REQUEST_CONNECT_TIMEOUT  = float(os.environ.get("REQUEST_CONNECT_TIMEOUT", "10"))
 LOG_LEVEL                = os.environ.get("LOG_LEVEL", "info").upper()
 CONFIG_PATH              = os.environ.get("CONFIG_PATH", "/etc/llmconduit/config.yaml")
+METRICS_TOKEN            = os.environ.get("METRICS_TOKEN", "")
+STREAM_USAGE             = os.environ.get("STREAM_USAGE", "true").lower() in ("1", "true", "yes")
+BACKEND_METRICS          = os.environ.get("BACKEND_METRICS", "true").lower() in ("1", "true", "yes")
+BACKEND_METRICS_TIMEOUT  = float(os.environ.get("BACKEND_METRICS_TIMEOUT", "5"))
 
 ADMIN_ENABLED = bool(ADMIN_TOKEN)
 
@@ -71,6 +79,48 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("llmconduit")
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+# One /metrics for everything: llmconduit's own numbers for every request,
+# whatever the backend, plus each healthy backend's own /metrics (vLLM's KV
+# cache, prefix hits, queue...) fetched at scrape time and tagged with a
+# `backend` label. Names follow the OpenTelemetry GenAI metrics (time to first
+# token, time per output token, input/output token usage).
+METRICS = CollectorRegistry()
+
+_LATENCY_BUCKETS = (0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60, 120, 300, 600)
+
+REQUESTS = Counter(
+    "llmconduit_requests", "Proxied requests by endpoint, model, backend, alias and status code.",
+    ["endpoint", "model", "backend", "alias", "status"], registry=METRICS,
+)
+REQUEST_DURATION = Histogram(
+    "llmconduit_request_duration_seconds", "Time from request to the last byte of the response.",
+    ["endpoint", "model", "backend"], buckets=_LATENCY_BUCKETS, registry=METRICS,
+)
+TIME_TO_FIRST_TOKEN = Histogram(
+    "llmconduit_time_to_first_token_seconds", "Streamed requests: time to the first generated token.",
+    ["model", "backend"], buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 15, 30, 60, 120), registry=METRICS,
+)
+TIME_PER_OUTPUT_TOKEN = Histogram(
+    "llmconduit_time_per_output_token_seconds", "Streamed requests: time per output token after the first.",
+    ["model", "backend"], buckets=(0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1),
+    registry=METRICS,
+)
+TOKENS = Counter(
+    "llmconduit_tokens", "Tokens reported in response usage, by type (input or output).",
+    ["model", "backend", "type"], registry=METRICS,
+)
+IN_FLIGHT = Gauge(
+    "llmconduit_requests_in_flight", "Requests currently being proxied.",
+    ["model", "backend"], registry=METRICS,
+)
+BACKEND_ERRORS = Counter(
+    "llmconduit_backend_errors", "Requests that failed to reach a backend, by kind.",
+    ["backend", "kind"], registry=METRICS,
+)
 
 # ---------------------------------------------------------------------------
 # Config loader
@@ -359,6 +409,30 @@ class BackendRegistry:
 
 registry = BackendRegistry()
 
+class _RegistryCollector:
+    """Backend health and alias targets, read from the registry at scrape time."""
+
+    def collect(self):
+        up = GaugeMetricFamily("llmconduit_backend_up", "1 if the backend answered its last model scan.",
+                               labels=["backend"])
+        models = GaugeMetricFamily("llmconduit_backend_models", "Models the backend listed on its last scan.",
+                                   labels=["backend"])
+        for info in registry._backends.values():
+            up.add_metric([info["name"]], 1 if info["healthy"] else 0)
+            models.add_metric([info["name"]], len(info["models"]))
+        aliases = GaugeMetricFamily("llmconduit_alias_info", "Where each alias points; the value is always 1.",
+                                    labels=["alias", "model", "backend", "source"])
+        for name, st in registry.alias_status().items():
+            model, _, backend = st["target"].rpartition("@")
+            aliases.add_metric([name, model, backend, st["source"]], 1)
+        yield up
+        yield models
+        yield aliases
+
+
+METRICS.register(_RegistryCollector())
+
+
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
@@ -367,6 +441,11 @@ security = HTTPBearer(auto_error=False)
 async def require_proxy_auth(credentials: HTTPAuthorizationCredentials = Depends(security)):
     if not credentials or credentials.credentials != PROXY_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+async def require_metrics_auth(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Open unless METRICS_TOKEN is set; never accepts the proxy key."""
+    if METRICS_TOKEN and (not credentials or credentials.credentials != METRICS_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid or missing metrics token")
 
 async def require_admin_auth(credentials: HTTPAuthorizationCredentials = Depends(security)):
     if not ADMIN_ENABLED:
@@ -426,16 +505,116 @@ def _inject_auth(headers: dict, backend_url: str, original_auth: Optional[str]) 
         headers.pop("Authorization", None)
     return headers
 
+_SSE_EVENT_END = re.compile(rb"\r?\n\r?\n")
+_TOKEN_FIELDS = ("content", "reasoning_content", "reasoning", "tool_calls")
+
+
+def _add_stream_usage(body: bytes) -> tuple[bytes, bool]:
+    """Ask the backend for a final usage chunk on a streamed chat/completion.
+
+    Returns the body and whether llmconduit added the request, in which case
+    the usage-only chunk is dropped before it reaches the client.
+    """
+    try:
+        data = json.loads(body)
+    except Exception:
+        return body, False
+    if not isinstance(data, dict) or not data.get("stream"):
+        return body, False
+    opts = data.get("stream_options") or {}
+    if opts.get("include_usage"):
+        return body, False
+    data["stream_options"] = {**opts, "include_usage": True}
+    return json.dumps(data).encode(), True
+
+
+class _StreamWatch:
+    """Watches an OpenAI-style SSE stream on its way through: first token time and usage.
+
+    Bytes are forwarded per complete event, so a usage chunk llmconduit asked for
+    can be dropped whole. Anything that is not SSE passes through at the end.
+    """
+
+    def __init__(self, drop_usage_chunk: bool):
+        self.drop_usage_chunk = drop_usage_chunk
+        self.first_token_at: Optional[float] = None
+        self.usage: Optional[dict] = None
+        self._buf = b""
+
+    def feed(self, chunk: bytes) -> bytes:
+        self._buf += chunk
+        out = []
+        while True:
+            m = _SSE_EVENT_END.search(self._buf)
+            if not m:
+                break
+            event, self._buf = self._buf[:m.end()], self._buf[m.end():]
+            if self._inspect(event):
+                out.append(event)
+        return b"".join(out)
+
+    def flush(self) -> bytes:
+        rest, self._buf = self._buf, b""
+        return rest
+
+    def _inspect(self, event: bytes) -> bool:
+        """Record what the event says; False means drop it."""
+        for line in event.splitlines():
+            if not line.startswith(b"data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == b"[DONE]":
+                continue
+            try:
+                data = json.loads(payload)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            choices = data.get("choices") or []
+            if self.first_token_at is None and any(_has_token(c) for c in choices):
+                self.first_token_at = time.monotonic()
+            if data.get("usage"):
+                self.usage = data["usage"]
+                if self.drop_usage_chunk and not choices:
+                    return False
+        return True
+
+
+def _has_token(choice) -> bool:
+    if not isinstance(choice, dict):
+        return False
+    delta = choice.get("delta") or {}
+    return bool(choice.get("text") or any(delta.get(f) for f in _TOKEN_FIELDS))
+
+
+def _record_usage(usage: Optional[dict], model: str, backend: str) -> Optional[int]:
+    """Count usage tokens; returns the output token count."""
+    if not isinstance(usage, dict):
+        return None
+    prompt, completion = usage.get("prompt_tokens"), usage.get("completion_tokens")
+    if isinstance(prompt, int):
+        TOKENS.labels(model, backend, "input").inc(prompt)
+    if isinstance(completion, int):
+        TOKENS.labels(model, backend, "output").inc(completion)
+        return completion
+    return None
+
+
 async def _proxy(
     request: Request,
     backend_url: str,
     rewritten_body: Optional[bytes] = None,
+    model: str = "",
+    alias: str = "",
+    endpoint: str = "other",
 ) -> Response:
     path = request.url.path
     query = request.url.query
     target = f"{backend_url}{path}"
     if query:
         target = f"{target}?{query}"
+    backend = registry._backends.get(backend_url, {}).get("name", backend_url)
 
     original_auth = request.headers.get("Authorization")
     headers = {
@@ -451,7 +630,24 @@ async def _proxy(
     except Exception:
         pass
 
+    started = time.monotonic()
+    in_flight = IN_FLIGHT.labels(model, backend)
+
+    def _done(status, usage=None, watch=None):
+        REQUESTS.labels(endpoint, model, backend, alias, str(status)).inc()
+        REQUEST_DURATION.labels(endpoint, model, backend).observe(time.monotonic() - started)
+        output_tokens = _record_usage(usage, model, backend)
+        if watch and watch.first_token_at is not None:
+            TIME_TO_FIRST_TOKEN.labels(model, backend).observe(watch.first_token_at - started)
+            if output_tokens and output_tokens > 1:
+                TIME_PER_OUTPUT_TOKEN.labels(model, backend).observe(
+                    (time.monotonic() - watch.first_token_at) / (output_tokens - 1))
+
     if is_stream:
+        drop_usage_chunk = False
+        if STREAM_USAGE and endpoint in ("/v1/chat/completions", "/v1/completions"):
+            body, drop_usage_chunk = _add_stream_usage(body)
+        watch = _StreamWatch(drop_usage_chunk)
         # Open the upstream stream BEFORE building the StreamingResponse.
         #
         # This used to be `async with client.stream(...)` inside the body
@@ -473,14 +669,22 @@ async def _proxy(
             resp = await client.send(upstream_req, stream=True)
         except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
             await client.aclose()
+            BACKEND_ERRORS.labels(backend, type(exc).__name__).inc()
+            _done(502)
             log.error("Connection error to %s: %s", backend_url, exc)
             raise HTTPException(status_code=502, detail=f"Backend unreachable: {backend_url}")
+        except httpx.HTTPError as exc:
+            await client.aclose()
+            BACKEND_ERRORS.labels(backend, type(exc).__name__).inc()
+            _done(502)
+            raise
 
         if resp.status_code >= 400:
             # Relay the backend's own status and body verbatim.
             err_body = await resp.aread()
             await resp.aclose()
             await client.aclose()
+            _done(resp.status_code)
             log.error(
                 "Backend %s returned %s for streaming request: %s",
                 backend_url,
@@ -494,13 +698,31 @@ async def _proxy(
             )
 
         async def _stream():
+            status = resp.status_code
+            in_flight.inc()
             try:
                 async for chunk in resp.aiter_raw():
-                    yield chunk
+                    out = watch.feed(chunk)
+                    if out:
+                        yield out
+                rest = watch.flush()
+                if rest:
+                    yield rest
             except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+                status = 502
+                BACKEND_ERRORS.labels(backend, type(exc).__name__).inc()
                 log.error("Stream error to %s: %s", backend_url, exc)
                 yield b"data: {\"error\": \"backend connection lost\"}\n\n"
+            except (asyncio.CancelledError, GeneratorExit):
+                status = 499  # client went away mid-stream (nginx's code for it)
+                raise
+            except httpx.HTTPError as exc:
+                status = 502
+                BACKEND_ERRORS.labels(backend, type(exc).__name__).inc()
+                raise
             finally:
+                in_flight.dec()
+                _done(status, watch.usage, watch)
                 await resp.aclose()
                 await client.aclose()
 
@@ -511,6 +733,7 @@ async def _proxy(
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
     else:
+        in_flight.inc()
         try:
             async with httpx.AsyncClient(timeout=_make_timeout()) as client:
                 resp = await client.request(
@@ -519,25 +742,49 @@ async def _proxy(
                     headers=headers,
                     content=body,
                 )
-            return Response(
-                content=resp.content,
-                status_code=resp.status_code,
-                headers={
-                    k: v for k, v in resp.headers.items()
-                    if k.lower() not in ("content-encoding", "transfer-encoding")
-                },
-                media_type=resp.headers.get("content-type"),
-            )
         except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+            BACKEND_ERRORS.labels(backend, type(exc).__name__).inc()
+            _done(502)
             log.error("Connection error to %s: %s", backend_url, exc)
             raise HTTPException(status_code=502, detail=f"Backend unreachable: {backend_url}")
+        except httpx.HTTPError as exc:
+            BACKEND_ERRORS.labels(backend, type(exc).__name__).inc()
+            _done(502)
+            raise
+        finally:
+            in_flight.dec()
+        usage = None
+        if "json" in resp.headers.get("content-type", ""):
+            try:
+                usage = resp.json().get("usage")
+            except Exception:
+                pass
+        _done(resp.status_code, usage)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers={
+                k: v for k, v in resp.headers.items()
+                if k.lower() not in ("content-encoding", "transfer-encoding")
+            },
+            media_type=resp.headers.get("content-type"),
+        )
+
+def _count_rejected(request: Request, status_code: int) -> None:
+    """A request turned away before reaching a backend; model is left blank since the caller made it up."""
+    REQUESTS.labels(request.url.path, "", "", "", str(status_code)).inc()
 
 async def _routed_proxy(request: Request) -> Response:
     """Resolve model → backend, with miss-triggered retry loop."""
     body = await request.body()
-    backend_url, raw_model_id = await _resolve_model(_json_model(body))
+    try:
+        backend_url, raw_model_id, alias = await _resolve_model(_json_model(body))
+    except HTTPException as exc:
+        _count_rejected(request, exc.status_code)
+        raise
     rewritten = _rewrite_model(body, raw_model_id)
-    return await _proxy(request, backend_url, rewritten_body=rewritten)
+    return await _proxy(request, backend_url, rewritten_body=rewritten,
+                        model=raw_model_id, alias=alias, endpoint=request.url.path)
 
 def _json_model(body: bytes) -> str:
     try:
@@ -549,10 +796,11 @@ def _json_model(body: bytes) -> str:
         raise HTTPException(status_code=400, detail="Missing 'model' field")
     return qualified
 
-async def _resolve_model(qualified: str) -> tuple[str, str]:
-    """Model or role alias → (backend url, raw model id), rescanning the backend on a miss."""
+async def _resolve_model(qualified: str) -> tuple[str, str, str]:
+    """Model or role alias → (backend url, raw model id, alias used or ""), rescanning the backend on a miss."""
     # Role alias (e.g. PRIMARY) → its current qualified target
     alias_target = registry.resolve_alias(qualified)
+    alias = qualified.upper() if alias_target else ""
     if alias_target:
         qualified = alias_target
 
@@ -600,7 +848,7 @@ async def _resolve_model(qualified: str) -> tuple[str, str]:
         )
 
     log.info("Routing '%s' → %s", qualified, backend_url)
-    return backend_url, qualified.rsplit("@", 1)[0]
+    return backend_url, qualified.rsplit("@", 1)[0], alias
 
 # ---------------------------------------------------------------------------
 # Audio and other non-chat endpoints
@@ -643,19 +891,23 @@ async def _routed_passthrough(request: Request) -> Response:
     """Route a JSON or multipart request by its model; stream the answer back untouched."""
     body = await request.body()
     content_type = request.headers.get("content-type", "")
-    if content_type.lower().startswith("multipart/form-data"):
-        boundary = _multipart_boundary(content_type)
-        qualified, span = _multipart_model(body, boundary) if boundary else (None, None)
-        if not qualified:
-            raise HTTPException(status_code=400, detail="Missing 'model' field")
-        backend_url, raw_model_id = await _resolve_model(qualified)
-        body = body[:span[0]] + raw_model_id.encode() + body[span[1]:]
-    else:
-        backend_url, raw_model_id = await _resolve_model(_json_model(body))
-        body = _rewrite_model(body, raw_model_id)
-    return await _passthrough(request, backend_url, body)
+    try:
+        if content_type.lower().startswith("multipart/form-data"):
+            boundary = _multipart_boundary(content_type)
+            qualified, span = _multipart_model(body, boundary) if boundary else (None, None)
+            if not qualified:
+                raise HTTPException(status_code=400, detail="Missing 'model' field")
+            backend_url, raw_model_id, alias = await _resolve_model(qualified)
+            body = body[:span[0]] + raw_model_id.encode() + body[span[1]:]
+        else:
+            backend_url, raw_model_id, alias = await _resolve_model(_json_model(body))
+            body = _rewrite_model(body, raw_model_id)
+    except HTTPException as exc:
+        _count_rejected(request, exc.status_code)
+        raise
+    return await _passthrough(request, backend_url, body, model=raw_model_id, alias=alias)
 
-async def _passthrough(request: Request, backend_url: str, body: bytes) -> Response:
+async def _passthrough(request: Request, backend_url: str, body: bytes, model: str = "", alias: str = "") -> Response:
     target = f"{backend_url}{request.url.path}"
     if request.url.query:
         target = f"{target}?{request.url.query}"
@@ -668,6 +920,14 @@ async def _passthrough(request: Request, backend_url: str, body: bytes) -> Respo
     # The upstream response is opened before the StreamingResponse is built, so
     # its status (and content type) are known in time; client and response
     # outlive this handler and are closed when the body is done.
+    backend = registry._backends.get(backend_url, {}).get("name", backend_url)
+    endpoint = request.url.path
+    started = time.monotonic()
+
+    def _done(status):
+        REQUESTS.labels(endpoint, model, backend, alias, str(status)).inc()
+        REQUEST_DURATION.labels(endpoint, model, backend).observe(time.monotonic() - started)
+
     client = httpx.AsyncClient(timeout=_make_timeout())
     try:
         resp = await client.send(
@@ -675,16 +935,30 @@ async def _passthrough(request: Request, backend_url: str, body: bytes) -> Respo
         )
     except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.TimeoutException) as exc:
         await client.aclose()
+        BACKEND_ERRORS.labels(backend, type(exc).__name__).inc()
+        _done(502)
         log.error("Connection error to %s: %s", backend_url, exc)
         raise HTTPException(status_code=502, detail=f"Backend unreachable: {backend_url}")
     if resp.status_code >= 400:
         log.warning("Backend %s returned %d for %s", backend_url, resp.status_code, request.url.path)
 
     async def _relay():
+        status = resp.status_code
+        in_flight = IN_FLIGHT.labels(model, backend)
+        in_flight.inc()
         try:
             async for chunk in resp.aiter_bytes():
                 yield chunk
+        except (asyncio.CancelledError, GeneratorExit):
+            status = 499
+            raise
+        except httpx.HTTPError as exc:
+            status = 502
+            BACKEND_ERRORS.labels(backend, type(exc).__name__).inc()
+            raise
         finally:
+            in_flight.dec()
+            _done(status)
             await resp.aclose()
             await client.aclose()
 
@@ -733,6 +1007,84 @@ async def health():
         "backends_total": len(registry._backends),
         "models": len(registry._routing),
     }
+
+# ---------------------------------------------------------------------------
+# Metrics route (open unless METRICS_TOKEN is set)
+# ---------------------------------------------------------------------------
+_COUNTER_LIKE = ("counter", "histogram", "summary", "gaugehistogram")
+
+async def _scrape_backend(client: httpx.AsyncClient, url: str, name: str):
+    """(name, families or None, seconds); families None = failed, [] = the backend has no /metrics."""
+    started = time.monotonic()
+    try:
+        resp = await client.get(f"{url}/metrics", headers=_inject_auth({}, url, None))
+        if resp.status_code == 404:
+            return name, [], time.monotonic() - started
+        resp.raise_for_status()
+        families = list(text_string_to_metric_families(resp.text))
+    except Exception as exc:
+        log.warning("Metrics from backend '%s' failed: %s %s", name, type(exc).__name__, exc)
+        return name, None, time.monotonic() - started
+    return name, families, time.monotonic() - started
+
+async def _backend_metric_families() -> list:
+    """Every healthy backend's metrics, merged by name, each sample labelled with its backend."""
+    targets = [(url, info["name"]) for url, info in registry._backends.items() if info["healthy"]]
+    async with httpx.AsyncClient(timeout=BACKEND_METRICS_TIMEOUT) as client:
+        results = await asyncio.gather(*[_scrape_backend(client, url, name) for url, name in targets])
+    up = GaugeMetricFamily("llmconduit_backend_metrics_up",
+                           "1 if the backend's /metrics was read on this scrape, 0 if it failed. "
+                           "Backends without a /metrics are left out.", labels=["backend"])
+    took = GaugeMetricFamily("llmconduit_backend_metrics_scrape_seconds",
+                             "Time to read the backend's /metrics on this scrape.", labels=["backend"])
+    merged: dict[str, Metric] = {}
+    for name, families, seconds in results:
+        if families == []:
+            continue
+        up.add_metric([name], 0 if families is None else 1)
+        took.add_metric([name], seconds)
+        if not families:
+            continue
+        counter_like = {f.name for f in families if f.type in _COUNTER_LIKE}
+        for fam in families:
+            # *_created is only a start timestamp, and as a separate family it clashes with its
+            # counter in OpenMetrics.
+            if fam.name.endswith("_created") and fam.name[:-len("_created")] in counter_like:
+                continue
+            out = merged.get(fam.name)
+            if out is None:
+                out = merged[fam.name] = Metric(fam.name, fam.documentation, fam.type, fam.unit)
+            elif out.type != fam.type:
+                log.warning("Metric '%s' is a %s on backend '%s' but a %s elsewhere; skipping it",
+                            fam.name, fam.type, name, out.type)
+                continue
+            for sample in fam.samples:
+                if fam.type in _COUNTER_LIKE and sample.name.endswith("_created"):
+                    continue
+                labels = dict(sample.labels)
+                if "backend" in labels:
+                    labels["exported_backend"] = labels.pop("backend")
+                labels["backend"] = name
+                out.add_sample(sample.name, labels, sample.value, sample.timestamp)
+    return [up, took, *merged.values()]
+
+class _Snapshot:
+    def __init__(self, families):
+        self.families = families
+
+    def collect(self):
+        return self.families
+
+@app.get("/metrics", dependencies=[Depends(require_metrics_auth)])
+async def metrics(request: Request):
+    """llmconduit's own metrics plus every backend's, in whichever format the scraper asks for."""
+    families = list(METRICS.collect())
+    if BACKEND_METRICS:
+        families += await _backend_metric_families()
+    snapshot = CollectorRegistry(auto_describe=False)
+    snapshot.register(_Snapshot(families))
+    encoder, content_type = choose_encoder(request.headers.get("accept", ""))
+    return Response(content=encoder(snapshot), media_type=content_type)
 
 # ---------------------------------------------------------------------------
 # Admin routes (gated by ADMIN_TOKEN, must be before catch-all)
