@@ -452,23 +452,61 @@ async def _proxy(
         pass
 
     if is_stream:
+        # Open the upstream stream BEFORE building the StreamingResponse.
+        #
+        # This used to be `async with client.stream(...)` inside the body
+        # generator. Starlette does not run that generator until after the
+        # response status has already been committed, so every streaming
+        # request returned 200 regardless of what the backend said. A backend
+        # 400 reached the caller as HTTP 200 wrapping an error payload that is
+        # not valid SSE; clients then report it as an empty stream with no
+        # finish_reason and the backend's actual message is lost.
+        # The non-streaming branch below always propagated the status.
+        client = httpx.AsyncClient(timeout=_make_timeout())
+        try:
+            upstream_req = client.build_request(
+                method=request.method,
+                url=target,
+                headers=headers,
+                content=body,
+            )
+            resp = await client.send(upstream_req, stream=True)
+        except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+            await client.aclose()
+            log.error("Connection error to %s: %s", backend_url, exc)
+            raise HTTPException(status_code=502, detail=f"Backend unreachable: {backend_url}")
+
+        if resp.status_code >= 400:
+            # Relay the backend's own status and body verbatim.
+            err_body = await resp.aread()
+            await resp.aclose()
+            await client.aclose()
+            log.error(
+                "Backend %s returned %s for streaming request: %s",
+                backend_url,
+                resp.status_code,
+                err_body[:500].decode("utf-8", "replace"),
+            )
+            return Response(
+                content=err_body,
+                status_code=resp.status_code,
+                media_type=resp.headers.get("content-type", "application/json"),
+            )
+
         async def _stream():
             try:
-                async with httpx.AsyncClient(timeout=_make_timeout()) as client:
-                    async with client.stream(
-                        method=request.method,
-                        url=target,
-                        headers=headers,
-                        content=body,
-                    ) as resp:
-                        async for chunk in resp.aiter_raw():
-                            yield chunk
+                async for chunk in resp.aiter_raw():
+                    yield chunk
             except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
                 log.error("Stream error to %s: %s", backend_url, exc)
                 yield b"data: {\"error\": \"backend connection lost\"}\n\n"
+            finally:
+                await resp.aclose()
+                await client.aclose()
 
         return StreamingResponse(
             _stream(),
+            status_code=resp.status_code,
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
