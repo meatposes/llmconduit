@@ -21,6 +21,32 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 # ---------------------------------------------------------------------------
 # Config from environment
 # ---------------------------------------------------------------------------
+# Context-window keys as they appear across OpenAI-compatible backends: vLLM
+# reports max_model_len, llama.cpp n_ctx / n_ctx_train, others context_length.
+# Clients (e.g. Hermes) probe for these same names, so dropping them here makes
+# every model look like the client's minimum-window fallback.
+_CONTEXT_LENGTH_KEYS = (
+    "max_model_len", "context_length", "context_window", "max_context_length",
+    "max_position_embeddings", "max_input_tokens", "max_sequence_length",
+    "max_seq_len", "n_ctx_train", "n_ctx", "ctx_size",
+)
+
+
+def _extract_context_length(entry: dict) -> Optional[int]:
+    """Return the context window advertised by a /v1/models entry, if any."""
+    if not isinstance(entry, dict):
+        return None
+    for key in _CONTEXT_LENGTH_KEYS:
+        v = entry.get(key)
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, int) and v > 0:
+            return v
+        if isinstance(v, str) and v.isdigit() and int(v) > 0:
+            return int(v)
+    return _extract_context_length(entry.get("meta")) if isinstance(entry.get("meta"), dict) else None
+
+
 PROXY_API_KEY            = os.environ.get("PROXY_API_KEY", "")
 ADMIN_TOKEN              = os.environ.get("ADMIN_TOKEN", "")
 REFRESH_INTERVAL         = int(os.environ.get("REFRESH_INTERVAL_SECONDS", "60"))
@@ -113,7 +139,7 @@ class BackendRegistry:
             self._rescan_locks[url] = asyncio.Lock()
         return self._rescan_locks[url]
 
-    async def _fetch_models(self, client: httpx.AsyncClient, url: str, api_key: Optional[str]) -> list[str]:
+    async def _fetch_models(self, client: httpx.AsyncClient, url: str, api_key: Optional[str]) -> list[dict]:
         headers = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -124,19 +150,27 @@ class BackendRegistry:
         )
         resp.raise_for_status()
         data = resp.json()
-        return [m["id"] for m in data.get("data", [])]
+        return [m for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
 
     async def _scan_one(self, client: httpx.AsyncClient, url: str, api_key_ref: Optional[str], alias: Optional[str] = None) -> dict:
         alias = normalize_alias(url, alias)
         bname = alias or backend_name_from_url(url)
         api_key = resolve_backend_key(api_key_ref)
         try:
-            models = await self._fetch_models(client, url, api_key)
-            log.info("Backend '%s' healthy — models: %s", bname, models)
-            return {"name": bname, "models": models, "healthy": True, "api_key_ref": api_key_ref, "alias": alias}
+            entries = await self._fetch_models(client, url, api_key)
+            models = [m["id"] for m in entries]
+            model_meta = {}
+            for m in entries:
+                ctx = _extract_context_length(m)
+                if ctx:
+                    model_meta[m["id"]] = ctx
+            log.info("Backend '%s' healthy — models: %s (context: %s)", bname, models, model_meta or "not advertised")
+            return {"name": bname, "models": models, "model_meta": model_meta,
+                    "healthy": True, "api_key_ref": api_key_ref, "alias": alias}
         except Exception as exc:
             log.warning("Backend '%s' unreachable: %s", bname, exc)
-            return {"name": bname, "models": [], "healthy": False, "api_key_ref": api_key_ref, "alias": alias}
+            return {"name": bname, "models": [], "model_meta": {},
+                    "healthy": False, "api_key_ref": api_key_ref, "alias": alias}
 
     async def _rebuild_routing(self, new_backends: dict[str, dict], new_aliases: dict[str, str]):
         new_routing: dict[str, str] = {}
@@ -275,23 +309,34 @@ class BackendRegistry:
                 qualified = f"{mid}@{info['name']}"
                 if qualified not in seen:
                     seen.add(qualified)
-                    out.append({
+                    entry = {
                         "id": qualified,
                         "object": "model",
                         "created": now,
                         "owned_by": info["name"],
-                    })
+                    }
+                    ctx = info.get("model_meta", {}).get(mid)
+                    if ctx:
+                        entry["max_model_len"] = ctx
+                        entry["context_length"] = ctx
+                    out.append(entry)
         for name, default_target in self._aliases.items():
             target = self._alias_overrides.get(name, default_target)
             backend_url = self.resolve(target)
             if not backend_url:
                 continue
-            out.append({
+            binfo = self._backends.get(backend_url, {})
+            entry = {
                 "id": name,
                 "object": "model",
                 "created": now,
-                "owned_by": self._backends.get(backend_url, {}).get("name", target.rsplit("@", 1)[-1]),
-            })
+                "owned_by": binfo.get("name", target.rsplit("@", 1)[-1]),
+            }
+            ctx = binfo.get("model_meta", {}).get(target.rsplit("@", 1)[0])
+            if ctx:
+                entry["max_model_len"] = ctx
+                entry["context_length"] = ctx
+            out.append(entry)
         return out
 
     def status(self) -> dict:
